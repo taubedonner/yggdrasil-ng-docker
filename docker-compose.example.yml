@@ -1,0 +1,44 @@
+version: "3.9"
+
+# Example of running yggdrasil-ng with CKR.
+# The config is mounted from ./config/yggdrasil.toml (priority).
+# If the file does not exist, an ephemeral config is created from environment variables.
+
+services:
+  yggdrasil:
+    image: ghcr.io/taubedonner/yggdrasil-ng-docker:latest
+    restart: unless-stopped
+
+    # Required to create a TUN interface and change sysctl parameters
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    devices:
+      - /dev/net/tun
+
+    # Expose listening port outside
+    ports:
+      - "1234:1234/tcp"
+
+    volumes:
+      - ./config:/config:ro
+
+    environment:
+      YGG_PEERS: "tcp://peer1.example.com:443 tls://peer2.example.com:443"
+      YGG_LISTEN: "tcp://[::]:1234"
+      YGG_ADMIN_LISTEN: "tcp://0.0.0.0:9001"
+
+      YGGDRASIL_PRIVATE_KEY: "<your_private_key>"
+
+      CKR_ENABLE: "true"
+      CKR_IPV4_ADDRESS: "10.99.0.1/24"
+      CKR_YGGDRASIL_ROUTING: "true"
+      # Format: "pubkey:cidr1,cidr2 pubkey2:cidr3"
+      CKR_REMOTE_SUBNETS: "<peer_public_key>:10.99.0.2/32"
+
+      # Format: "CIDR:gateway CIDR2:gateway2"
+      HOST_ROUTES: "192.168.88.0/24:172.17.0.1"
+
+      NAT_ENABLE: "false"
+      # NAT_SOURCE_CIDR: "10.99.0.0/24"
+      # NAT_OUT_IFACE: "eth0"
