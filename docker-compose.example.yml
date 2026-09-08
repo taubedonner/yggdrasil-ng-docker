@@ -1,44 +1,71 @@
-version: "3.9"
-
-# Example of running yggdrasil-ng with CKR.
-# The config is mounted from ./config/yggdrasil.toml (priority).
-# If the file does not exist, an ephemeral config is created from environment variables.
+# Example: yggdrasil-ng with CKR, reaching a LAN behind the remote node.
+#
+# A config mounted at /config/yggdrasil.toml wins over every environment
+# variable below. Without it an ephemeral config is generated on each start,
+# so set YGGDRASIL_PRIVATE_KEY or the node identity changes every restart.
+#
+# Note: the `version:` key was removed - modern Compose ignores it and warns.
 
 services:
   yggdrasil:
     image: ghcr.io/taubedonner/yggdrasil-ng-docker:latest
     restart: unless-stopped
 
-    # Required to create a TUN interface and change sysctl parameters
+    # NET_ADMIN is enough: it covers creating the TUN, adding routes and the
+    # namespaced sysctls. SYS_ADMIN is not needed and was dropped.
     cap_add:
       - NET_ADMIN
-      - SYS_ADMIN
     devices:
       - /dev/net/tun
 
-    # Expose listening port outside
+    # Only needed when others peer INTO this node. Must match YGG_LISTEN.
     ports:
       - "1234:1234/tcp"
+
+    # Uncomment to put the TUN and its routes on the host itself rather than in
+    # the container namespace. Required if LAN clients should reach the tunnel.
+    # Read the NAT warning in the README before combining this with a host
+    # firewall that manages nftables (OpenWrt fw4).
+    # network_mode: host
 
     volumes:
       - ./config:/config:ro
 
     environment:
-      YGG_PEERS: "tcp://peer1.example.com:443 tls://peer2.example.com:443"
-      YGG_LISTEN: "tcp://[::]:1234"
-      YGG_ADMIN_LISTEN: "tcp://0.0.0.0:9001"
-
       YGGDRASIL_PRIVATE_KEY: "<your_private_key>"
 
+      YGG_PEERS: "tls://peer1.example.com:443 tcp://peer2.example.com:1234"
+      YGG_LISTEN: "tcp://[::]:1234"
+      YGG_ADMIN_LISTEN: "tcp://0.0.0.0:9001"
+      # YGG_TUN_NAME: "ygg0"
+      # YGG_MTU: "65535"
+
       CKR_ENABLE: "true"
-      CKR_IPV4_ADDRESS: "10.99.0.1/24"
+      # Addresses for the TUN, space separated, dual-stack allowed.
+      CKR_IP_ADDRESSES: "10.99.0.1/24"
       CKR_YGGDRASIL_ROUTING: "true"
-      # Format: "pubkey:cidr1,cidr2 pubkey2:cidr3"
-      CKR_REMOTE_SUBNETS: "<peer_public_key>:10.99.0.2/32"
+      CKR_INSTALL_SYSTEM_ROUTES: "true"
 
-      # Format: "CIDR:gateway CIDR2:gateway2"
-      HOST_ROUTES: "192.168.88.0/24:172.17.0.1"
+      # "pubkey:cidr1,cidr2 pubkey2:cidr3"
+      #
+      # This is a longest-prefix-match routing table AND the inbound filter:
+      # a packet is accepted only if the route for its source address points at
+      # the peer that sent it. The remote end needs the mirror-image entry, or
+      # traffic leaves and the replies are silently dropped.
+      #
+      # To reach a LAN behind the remote node, name the LAN prefix itself:
+      #   "<REMOTE_KEY>:192.168.88.0/24"
+      # and on the remote node point its route back at this node's TUN address:
+      #   "<THIS_KEY>:10.99.0.1/32"
+      CKR_REMOTE_SUBNETS: "<remote_public_key>:192.168.88.0/24"
 
+      # "CIDR:gateway CIDR2:gateway2" - applied with `ip route replace`.
+      # HOST_ROUTES: "192.168.88.0/24:172.17.0.1"
+
+      # Exit-node scenario only. Rules are idempotent and removed on shutdown.
       NAT_ENABLE: "false"
       # NAT_SOURCE_CIDR: "10.99.0.0/24"
       # NAT_OUT_IFACE: "eth0"
+      # NAT_IPV6: "false"
+      # NAT_SOURCE_CIDR6: "200::/7"
+      # NAT_CLAMP_MSS: "true"

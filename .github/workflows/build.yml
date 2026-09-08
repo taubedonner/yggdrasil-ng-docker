@@ -1,21 +1,30 @@
 name: Build and Release
 
+# Builds Yggdrasil-ng from upstream source with cross-rs, publishes the binaries
+# as release assets, and assembles multi-arch container images from them.
+#
+# The upstream version is pinned by YGG_VERSION below and is deliberately NOT
+# taken from this repository's own tag: the two version lines are independent,
+# and checking upstream out at our tag fails as soon as they diverge.
+
 on:
   push:
     tags:
       - 'v*.*.*'
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Tag to build (e.g. v0.1.0)'
+      ygg_version:
+        description: 'Upstream Yggdrasil-ng tag to build (e.g. v0.3.0)'
         required: false
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # Upstream tag built when the workflow is not dispatched with an override.
+  YGG_VERSION: v0.3.0
 
 jobs:
-  ## Build native binaries for each target
+  ## Build binaries for each target
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
@@ -32,6 +41,7 @@ jobs:
             runner: ubuntu-24.04
             cross: true
             artifact: yggdrasil-x86_64-linux-musl
+            docker_arch: amd64
 
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04
@@ -42,13 +52,26 @@ jobs:
             runner: ubuntu-24.04
             cross: true
             artifact: yggdrasil-aarch64-linux-musl
+            docker_arch: arm64
+
+          # 32-bit ARM covers older MikroTik boards with the container feature
+          # and OpenWrt devices that are not aarch64.
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-24.04
+            cross: true
+            artifact: yggdrasil-armv7-linux-musleabihf
+            docker_arch: arm
 
     steps:
-      - name: Checkout source
+      - name: Resolve upstream version
+        id: ver
+        run: echo "tag=${{ github.event.inputs.ygg_version || env.YGG_VERSION }}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Yggdrasil-ng ${{ steps.ver.outputs.tag }}
         uses: actions/checkout@v6
         with:
           repository: Revertron/Yggdrasil-ng
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ steps.ver.outputs.tag }}
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -62,16 +85,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ steps.ver.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-${{ steps.ver.outputs.tag }}-
             ${{ runner.os }}-cargo-${{ matrix.target }}-
 
-      - name: Install cross (for cross-compilation)
+      - name: Install cross
         if: matrix.cross
         uses: taiki-e/install-action@v2
         with:
           tool: cross
 
+      # ckr is part of the upstream default feature set since 0.3.0; it stays
+      # spelled out so a future default change cannot silently drop it.
       - name: Build binary (native)
         if: '!matrix.cross'
         run: cargo build --release --features ckr --target ${{ matrix.target }}
@@ -81,8 +107,7 @@ jobs:
         run: cross build --release --features ckr --target ${{ matrix.target }}
 
       - name: Rename artifact
-        run: |
-          cp target/${{ matrix.target }}/release/yggdrasil ${{ matrix.artifact }}
+        run: cp target/${{ matrix.target }}/release/yggdrasil ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -91,10 +116,11 @@ jobs:
           path: ${{ matrix.artifact }}
           retention-days: 7
 
-  # Publish GitHub Release with ELF files
+  ## Publish GitHub Release with the ELF files
   release:
     name: Publish GitHub Release
     needs: build-binaries
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -112,17 +138,12 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          name: Release ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
           generate_release_notes: true
-          files: |
-            artifacts/yggdrasil-x86_64-linux-gnu
-            artifacts/yggdrasil-x86_64-linux-musl
-            artifacts/yggdrasil-aarch64-linux-gnu
-            artifacts/yggdrasil-aarch64-linux-musl
-            artifacts/SHA256SUMS.txt
+          files: artifacts/*
 
-  ## Docker multi-arch images
+  ## Multi-arch container images
   docker:
     name: Build & push Docker images
     needs: build-binaries
@@ -135,23 +156,33 @@ jobs:
       - name: Checkout this repo (Dockerfile + entrypoint)
         uses: actions/checkout@v6
 
+      # musl builds are static, which is what the Alpine base expects.
       - name: Download amd64 binary
         uses: actions/download-artifact@v8
         with:
           name: yggdrasil-x86_64-linux-musl
           path: bin/amd64/
 
-      - name: Download arm64 binary (musl — static, подходит для Alpine)
+      - name: Download arm64 binary
         uses: actions/download-artifact@v8
         with:
           name: yggdrasil-aarch64-linux-musl
           path: bin/arm64/
 
-      - name: Rename binaries to uniform name
+      - name: Download armv7 binary
+        uses: actions/download-artifact@v8
+        with:
+          name: yggdrasil-armv7-linux-musleabihf
+          path: bin/arm/
+
+      # Dockerfile copies bin/${TARGETARCH}/yggdrasil; TARGETARCH is
+      # amd64 / arm64 / arm (the last one for linux/arm/v7).
+      - name: Normalise binary names
         run: |
-          mv bin/amd64/yggdrasil-x86_64-linux-musl  bin/amd64/yggdrasil
-          mv bin/arm64/yggdrasil-aarch64-linux-musl bin/arm64/yggdrasil
-          chmod +x bin/amd64/yggdrasil bin/arm64/yggdrasil
+          mv bin/amd64/yggdrasil-x86_64-linux-musl        bin/amd64/yggdrasil
+          mv bin/arm64/yggdrasil-aarch64-linux-musl       bin/arm64/yggdrasil
+          mv bin/arm/yggdrasil-armv7-linux-musleabihf     bin/arm/yggdrasil
+          chmod +x bin/amd64/yggdrasil bin/arm64/yggdrasil bin/arm/yggdrasil
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -178,11 +209,9 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
